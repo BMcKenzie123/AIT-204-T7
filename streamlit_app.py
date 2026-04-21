@@ -127,7 +127,7 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    "Author: **Brogan Jackson**  \nCourse: Deep Learning — Spring 2026"
+    "Author: **Brogan McKenzie and Adonijah Farner**  \nCourse: Deep Learning — Spring 2026"
 )
 
 
