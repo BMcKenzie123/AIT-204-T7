@@ -36,6 +36,7 @@ Deploy:
 from __future__ import annotations
 
 import io
+import re
 from pathlib import Path
 
 import numpy as np
@@ -58,21 +59,58 @@ st.set_page_config(
 )
 
 OUT_DIR = Path("gan_outputs")
-CHECKPOINT = OUT_DIR / "generator_final.pt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ======================================================================
-# Model loading (cached so we don't reload on every interaction)
+# Model discovery & loading
 # ======================================================================
-@st.cache_resource(show_spinner="Loading generator weights…")
-def load_generator() -> Generator | None:
-    """Return a Generator with weights loaded, or None if no checkpoint exists."""
-    if not CHECKPOINT.exists():
-        return None
+UNTRAINED_KEY = "0 (untrained)"
+
+
+def discover_checkpoints() -> dict[str, Path | None]:
+    """
+    Scan gan_outputs/ and return a dict of {label: checkpoint_path} sorted by
+    epoch number. `generator_final.pt` is labeled as its nearest milestone
+    epoch if the filename pattern matches, otherwise as "final". An untrained
+    entry (no path) is always first so users can see pre-training noise.
+    """
+    options: dict[str, Path | None] = {UNTRAINED_KEY: None}
+
+    # Epoch milestones — e.g. generator_epoch001.pt -> "epoch 1"
+    epoch_pattern = re.compile(r"generator_epoch(\d+)\.pt$")
+    matches: list[tuple[int, Path]] = []
+    if OUT_DIR.exists():
+        for path in OUT_DIR.iterdir():
+            m = epoch_pattern.match(path.name)
+            if m:
+                matches.append((int(m.group(1)), path))
+    for epoch, path in sorted(matches):
+        options[f"epoch {epoch}"] = path
+
+    # generator_final.pt is the canonical "last trained" checkpoint. List it
+    # last, and label it with the final epoch number if we know it.
+    final = OUT_DIR / "generator_final.pt"
+    if final.exists():
+        options["final (fully trained)"] = final
+
+    return options
+
+
+@st.cache_resource(show_spinner=False)
+def load_generator_at(checkpoint_path: str | None) -> Generator:
+    """
+    Return a Generator with the given checkpoint loaded. `checkpoint_path`
+    is either a string path or None for the untrained baseline.
+
+    Cached per-path — switching between models is instant after the first
+    load of each. We accept `str` (not Path) because Path isn't hashable
+    across Streamlit reruns in every version.
+    """
     g = Generator().to(DEVICE)
-    state = torch.load(CHECKPOINT, map_location=DEVICE)
-    g.load_state_dict(state)
+    if checkpoint_path is not None:
+        state = torch.load(checkpoint_path, map_location=DEVICE)
+        g.load_state_dict(state)
     g.eval()
     return g
 
@@ -115,19 +153,48 @@ st.sidebar.markdown(
     "writeup for the project. Use the tabs on the main page to navigate."
 )
 
-generator = load_generator()
-if generator is None:
+# ---- Checkpoint picker ----
+checkpoints = discover_checkpoints()
+trained_count = sum(1 for v in checkpoints.values() if v is not None)
+
+st.sidebar.markdown("### Model checkpoint")
+if trained_count == 0:
     st.sidebar.error(
-        "**No trained model loaded.**\n\n"
-        f"Drop a PyTorch state-dict at `{CHECKPOINT}` (produced by "
-        "`train_gan.py`) and rerun the app."
+        "**No trained checkpoints found.**\n\n"
+        f"Drop PyTorch state-dicts (e.g. `generator_epoch030.pt`, "
+        f"`generator_final.pt`) into `{OUT_DIR}/` and rerun the app. "
+        "`train_gan.py` writes them automatically."
     )
+    selected_label = UNTRAINED_KEY
 else:
-    st.sidebar.success(f"Generator loaded  •  device: `{DEVICE}`")
+    options = list(checkpoints.keys())
+    # Default to the final/latest trained checkpoint — not the untrained one
+    default_label = next(
+        (k for k in reversed(options) if checkpoints[k] is not None),
+        UNTRAINED_KEY,
+    )
+    selected_label = st.sidebar.selectbox(
+        "Generator to use",
+        options,
+        index=options.index(default_label),
+        help=(
+            "Pick which training snapshot to sample from. Watching the same "
+            "seed across epochs shows how the same latent vector evolves "
+            "from noise into a digit as training progresses."
+        ),
+    )
+
+selected_path = checkpoints[selected_label]
+generator = load_generator_at(str(selected_path) if selected_path else None)
+
+if selected_path is None:
+    st.sidebar.info(f"Loaded: **{UNTRAINED_KEY}** (random weights)")
+else:
+    st.sidebar.success(f"Loaded: **{selected_label}**  •  `{DEVICE}`")
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    "Author: **Brogan McKenzie and Adonijah Farner**  \nCourse: Deep Learning — Spring 2026"
+    "Authors: **Brogan McKenzie** and **Adonijah Farner**  \nCourse: Deep Learning — Spring 2026"
 )
 
 
@@ -145,74 +212,81 @@ tab_demo, tab_report, tab_training, tab_code = st.tabs(
 with tab_demo:
     st.header("Live Demo")
     st.caption(
-        "Sample fresh noise vectors and watch the trained generator "
-        "synthesise handwritten digits. Re-roll as many times as you like."
+        "Sample fresh noise vectors and watch the selected generator "
+        "synthesise handwritten digits. Switch checkpoints in the sidebar "
+        "to see the same latent inputs evolve across training."
     )
 
-    if generator is None:
+    if trained_count == 0:
         st.warning(
-            "Live generation requires a trained checkpoint. See sidebar."
+            "No trained checkpoints are available, so you're looking at a "
+            "randomly initialised generator — pure noise. Train the model "
+            "(see sidebar instructions) to enable the full demo."
         )
-        st.info(
-            "Meanwhile, here is what an untrained generator produces: "
-            "pure noise — the whole point of training is to make these "
-            "look like real digits."
+
+    col_controls, col_display = st.columns([1, 2])
+
+    with col_controls:
+        n_samples = st.slider(
+            "Number of samples", min_value=4, max_value=100,
+            value=25, step=1,
         )
-        rng = np.random.default_rng(0)
-        mock = rng.random((25, 28, 28))
-        st.image(np_to_pil(tile(mock, 5)).resize((280, 280), Image.NEAREST),
-                 caption="Untrained output (placeholder)")
-    else:
-        col_controls, col_display = st.columns([1, 2])
+        cols_per_row = st.slider(
+            "Samples per row", min_value=2, max_value=10, value=5
+        )
+        seed = st.number_input(
+            "Random seed", value=0, step=1,
+            help="Keep the seed fixed and switch checkpoints to see the "
+                 "same latent vectors produce different outputs across "
+                 "training. Re-roll to sample new noise.",
+        )
+        if st.button("🎲 Re-roll", type="primary", use_container_width=True):
+            st.session_state["last_seed"] = int(np.random.randint(0, 1_000_000))
+        seed = st.session_state.get("last_seed", seed)
+        st.caption(f"Current seed: `{seed}`")
 
-        with col_controls:
-            n_samples = st.slider(
-                "Number of samples", min_value=4, max_value=100,
-                value=25, step=1,
+    with col_display:
+        with st.spinner("Generating…"):
+            imgs = generate_samples(generator, n_samples, seed=seed)
+            grid = tile(imgs, cols_per_row)
+            # Upscale for crisp display (28×28 is tiny on modern screens)
+            scale = max(8, min(16, 400 // grid.shape[1]))
+            pil = np_to_pil(grid).resize(
+                (grid.shape[1] * scale, grid.shape[0] * scale),
+                Image.NEAREST,
             )
-            cols_per_row = st.slider(
-                "Samples per row", min_value=2, max_value=10, value=5
+            st.image(
+                pil,
+                caption=(
+                    f"{n_samples} samples · seed {seed} · "
+                    f"checkpoint: {selected_label}"
+                ),
             )
-            seed = st.number_input(
-                "Random seed (empty for fresh)", value=0, step=1,
-                help="Set a seed to reproduce the same sample grid. "
-                     "Use the re-roll button to change it on demand.",
-            )
-            if st.button("🎲 Re-roll", type="primary", use_container_width=True):
-                seed = int(np.random.randint(0, 1_000_000))
-                st.session_state["last_seed"] = seed
-            seed = st.session_state.get("last_seed", seed)
-            st.caption(f"Current seed: `{seed}`")
 
-        with col_display:
-            with st.spinner("Generating…"):
-                imgs = generate_samples(generator, n_samples, seed=seed)
-                grid = tile(imgs, cols_per_row)
-                # Upscale for crisp display (28×28 is tiny on modern screens)
-                scale = max(8, min(16, 400 // grid.shape[1]))
-                pil = np_to_pil(grid).resize(
-                    (grid.shape[1] * scale, grid.shape[0] * scale),
-                    Image.NEAREST,
-                )
-                st.image(pil, caption=f"{n_samples} samples · seed {seed}")
-
-            buf = io.BytesIO()
-            np_to_pil(grid).save(buf, format="PNG")
-            st.download_button(
-                "⬇  Download grid (PNG)",
-                data=buf.getvalue(),
-                file_name=f"gan_samples_seed{seed}.png",
-                mime="image/png",
-            )
+        buf = io.BytesIO()
+        np_to_pil(grid).save(buf, format="PNG")
+        safe_label = re.sub(r"[^a-zA-Z0-9]+", "_", selected_label).strip("_")
+        st.download_button(
+            "⬇  Download grid (PNG)",
+            data=buf.getvalue(),
+            file_name=f"gan_samples_{safe_label}_seed{seed}.png",
+            mime="image/png",
+        )
 
     st.markdown("---")
     st.subheader("What are you looking at?")
     st.markdown(
         "Each sample starts life as a 100-dimensional vector drawn from a "
-        "Gaussian. The trained generator maps that vector to a 784-dim "
-        "tensor, which is reshaped to 28 × 28 pixels and displayed above. "
-        "Different seeds produce different noise vectors, which produce "
-        "different digits."
+        "Gaussian. The generator maps that vector to a 784-dim tensor, which "
+        "is reshaped to 28 × 28 pixels and displayed above. Different seeds "
+        "produce different noise vectors, which produce different digits."
+    )
+    st.markdown(
+        "**Tip — compare checkpoints.** Pick a seed, then use the sidebar "
+        "selector to cycle through epochs 0 → 1 → 30 → 100 → final. The "
+        "same 25 noise vectors stay fixed; only the generator's learned "
+        "mapping changes. That's what the progression figure on the "
+        "Training tab is showing at full scale."
     )
 
 
@@ -222,124 +296,151 @@ with tab_demo:
 with tab_report:
     st.header("Technical Report")
 
+    # -- 1. Problem statement ------------------------------------------------
+    st.markdown("### 1. Problem Statement")
     st.markdown(
-        """
-### 1. Problem Statement
+        "Synthetic images have become ubiquitous on social media, and their "
+        "growing realism actively shapes public discourse — doctored photos, "
+        "AI-generated \"evidence\" of political events, deep-fake endorsements. "
+        "Understanding **how** such images are produced is a prerequisite to "
+        "being able to detect them and to reason critically about the media "
+        "we consume."
+    )
+    st.markdown(
+        "This project implements a classical **Generative Adversarial "
+        "Network** (Goodfellow et al., 2014) from scratch in PyTorch and "
+        "trains it on the MNIST handwritten-digit dataset. MNIST is "
+        "deliberately chosen as a toy domain:"
+    )
+    st.markdown(
+        "- Small enough to train on a single consumer GPU in minutes.\n"
+        "- Has an obvious \"looks right / looks wrong\" sanity check.\n"
+        "- The lessons transfer directly to modern systems like StyleGAN or "
+        "diffusion-based deep-fake pipelines."
+    )
+    st.markdown(
+        "**Goal.** Build a generator G that converts 100-dim Gaussian noise "
+        "into 28 × 28 digit images, and a discriminator D that distinguishes "
+        "real MNIST from G's output. Train them against each other so G's "
+        "output progressively becomes harder and harder for D to reject."
+    )
 
-Synthetic images have become ubiquitous on social media, and their growing
-realism actively shapes public discourse — doctored photos, AI-generated
-"evidence" of political events, deep-fake endorsements. Understanding **how**
-such images are produced is a prerequisite to being able to detect them and
-to reason critically about the media we consume.
+    st.markdown("---")
 
-This project implements a classical **Generative Adversarial Network**
-(Goodfellow et al., 2014) from scratch in PyTorch and trains it on the MNIST
-handwritten-digit dataset. MNIST is deliberately chosen as a toy domain:
+    # -- 2. Algorithm --------------------------------------------------------
+    st.markdown("### 2. Algorithm of the Solution")
+    st.markdown(
+        "**Generator G.** Maps a noise vector z drawn from N(0, I) in R¹⁰⁰ "
+        "to a 784-dim image vector. Three Dense blocks (256 → 512 → 1024) "
+        "each followed by `LeakyReLU(0.2)` and `BatchNorm1d`. The output "
+        "uses `tanh`, matching the [-1, 1] range of the preprocessed real "
+        "images."
+    )
+    st.markdown(
+        "**Discriminator D.** Takes a 784-dim image, outputs a scalar in "
+        "[0, 1] interpreted as P(real). Three Dense blocks (1024 → 512 → "
+        "256) with `LeakyReLU(0.2)`, then sigmoid. Batch-norm is "
+        "deliberately omitted — BN in D tends to memorise batch statistics "
+        "and destabilise training."
+    )
+    st.markdown(
+        "**Training.** Two independent Adam optimisers, one per network. "
+        "For each batch:"
+    )
+    st.markdown(
+        "1. Sample real MNIST images; label them `1`.\n"
+        "2. Generate fake images from fresh noise; label them `0`.\n"
+        "3. One gradient step on `d_opt` using real + fake loss.\n"
+        "4. Generate fresh fakes; label them `1` (trick: claim they're real); "
+        "one gradient step on `g_opt` only — D's weights are frozen "
+        "implicitly because its parameters aren't in `g_opt`."
+    )
+    st.markdown(
+        "Because each optimiser only owns its own network's parameters, "
+        "freezing one network during the other's update requires no special "
+        "flags — this is why PyTorch is less bug-prone for GAN training "
+        "than frameworks that rely on a `.trainable = False` switch."
+    )
 
-- Small enough to train on a single consumer GPU in minutes.
-- Has an obvious "looks right / looks wrong" sanity check.
-- The lessons transfer directly to modern systems like StyleGAN or
-  diffusion-based deep-fake pipelines.
+    st.markdown("#### Objective")
+    # Dedicated LaTeX block — isolated from surrounding markdown so a parse
+    # glitch in the math can't cascade into the rest of the document.
+    st.latex(
+        r"\min_G \max_D \; "
+        r"\mathbb{E}_{x \sim p_\text{data}}\bigl[\log D(x)\bigr] "
+        r"+ \mathbb{E}_{z \sim p_z}\bigl[\log\bigl(1 - D(G(z))\bigr)\bigr]"
+    )
+    st.markdown(
+        "In practice we optimise the non-saturating variant for G "
+        "(maximise log D(G(z))), which gives stronger gradients early in "
+        "training."
+    )
 
-**Goal.** Build a generator $G$ that converts 100-dim Gaussian noise into
-28 × 28 digit images, and a discriminator $D$ that distinguishes real MNIST
-from $G$'s output. Train them against each other so $G$'s output
-progressively becomes harder and harder for $D$ to reject.
+    st.markdown("---")
 
----
+    # -- 3. Findings ---------------------------------------------------------
+    st.markdown("### 3. Analysis of Findings")
+    st.markdown(
+        "**Qualitative progression.** At epoch 1 the generator produces pure "
+        "high-frequency noise. By epoch 30 blob-like dark regions on a "
+        "lighter background resemble the global \"ink in the middle of a "
+        "28 × 28 canvas\" structure of MNIST. By epoch 100 many samples are "
+        "plausibly recognisable as digits (0s, 1s, and 7s tend to appear "
+        "first — simple strokes). By epoch 400 the majority of samples are "
+        "clearly legible handwritten digits."
+    )
+    st.markdown(
+        "**Quantitative signal.** The discriminator-confidence histogram is "
+        "the cleanest diagnostic. If training worked, the distribution of "
+        "D's score on generator output shifts from being concentrated near 0 "
+        "(at the start everything is obviously fake) to overlapping "
+        "substantially with the real-data distribution. The fraction of "
+        "fakes misclassified as real is a direct measure of how well G is "
+        "fooling D. Loss curves that oscillate around a steady mean, rather "
+        "than one side collapsing to zero, indicate the adversarial game is "
+        "in healthy equilibrium."
+    )
+    st.markdown("**Limitations.**")
+    st.markdown(
+        "1. Dense-only GAN — no convolutions. DCGAN-style architectures "
+        "produce sharper images because they exploit spatial structure.\n"
+        "2. MNIST is single-channel, low-resolution, tightly centred. "
+        "Scaling to natural images needs conv layers, much more data and "
+        "compute.\n"
+        "3. Mode-collapse risk: the generator may ignore some digit classes. "
+        "A quick visual audit of the final sample grid is essential."
+    )
+    st.markdown(
+        "**So — does this GAN produce convincing fakes?** At 28 × 28 "
+        "resolution, after 400 epochs, yes. Casual human inspection would "
+        "not reliably distinguish the best generated digits from real MNIST "
+        "samples. The same adversarial principle, scaled up with "
+        "convolutions and orders of magnitude more compute, is what powers "
+        "modern deep-fake tools."
+    )
 
-### 2. Algorithm of the Solution
+    st.markdown("---")
 
-**Generator $G$.** Maps $\\mathbf{z} \\sim \\mathcal{N}(0, I)$, $\\mathbf{z}
-\\in \\mathbb{R}^{100}$, to a 784-dim image vector. Three Dense blocks
-(256 → 512 → 1024) each followed by `LeakyReLU(0.2)` and `BatchNorm1d`.
-The output uses `tanh`, matching the $[-1, 1]$ range of the preprocessed
-real images.
-
-**Discriminator $D$.** Takes a 784-dim image, outputs a scalar in $[0, 1]$
-interpreted as $P(\\text{real})$. Three Dense blocks (1024 → 512 → 256) with
-`LeakyReLU(0.2)`, then sigmoid. Batch-norm is deliberately omitted — BN in
-$D$ tends to memorise batch statistics and destabilise training.
-
-**Training.** Two independent Adam optimisers, one per network. For each
-batch:
-
-1. Sample real MNIST images; label them `1`.
-2. Generate fake images from fresh noise; label them `0`.
-3. One gradient step on `d_opt` using real + fake loss.
-4. Generate fresh fakes; label them `1` (trick: claim they're real); one
-   gradient step on `g_opt` only — D's weights are frozen implicitly
-   because its parameters aren't in `g_opt`.
-
-Because each optimiser only owns its own network's parameters, freezing
-one network during the other's update requires no special flags — this is
-why PyTorch is less bug-prone for GAN training than frameworks that rely
-on a `.trainable = False` switch.
-
-### Objective
-
-$$\\min_G \\max_D \\; \\mathbb{E}_{x \\sim p_\\text{data}}\\!\\bigl[\\log D(x)\\bigr]
-\\,+\\, \\mathbb{E}_{z \\sim p_z}\\!\\bigl[\\log(1 - D(G(z)))\\bigr]$$
-
-In practice we optimise the non-saturating variant for $G$ (maximise
-$\\log D(G(z))$), which gives stronger gradients early in training.
-
----
-
-### 3. Analysis of Findings
-
-**Qualitative progression.** At epoch 1 the generator produces pure
-high-frequency noise. By epoch 30 blob-like dark regions on a lighter
-background resemble the global "ink in the middle of a 28 × 28 canvas"
-structure of MNIST. By epoch 100 many samples are plausibly recognisable
-as digits (0s, 1s, and 7s tend to appear first — simple strokes).
-By epoch 400 the majority of samples are clearly legible handwritten
-digits.
-
-**Quantitative signal.** The discriminator-confidence histogram is the
-cleanest diagnostic. If training worked, the distribution of $D$'s score
-on generator output shifts from being concentrated near 0 (at the start
-everything is obviously fake) to overlapping substantially with the
-real-data distribution. The fraction of fakes misclassified as real is a
-direct measure of how well G is fooling D. Loss curves that oscillate
-around a steady mean, rather than one side collapsing to zero, indicate
-the adversarial game is in healthy equilibrium.
-
-**Limitations.**
-
-1. Dense-only GAN — no convolutions. DCGAN-style architectures produce
-   sharper images because they exploit spatial structure.
-2. MNIST is single-channel, low-resolution, tightly centred. Scaling to
-   natural images needs conv layers, much more data and compute.
-3. Mode-collapse risk: the generator may ignore some digit classes. A
-   quick visual audit of the final sample grid is essential.
-
-**So — does this GAN produce convincing fakes?** At 28 × 28 resolution,
-after 400 epochs, yes. Casual human inspection would not reliably
-distinguish the best generated digits from real MNIST samples. The same
-adversarial principle, scaled up with convolutions and orders of
-magnitude more compute, is what powers modern deep-fake tools.
-
----
-
-### 4. References
-
-1. Goodfellow, I., Pouget-Abadie, J., Mirza, M., Xu, B., Warde-Farley, D.,
-   Ozair, S., Courville, A., & Bengio, Y. (2014). *Generative Adversarial
-   Nets.* NeurIPS 27.
-2. Radford, A., Metz, L., & Chintala, S. (2016). *Unsupervised Representation
-   Learning with Deep Convolutional Generative Adversarial Networks.* ICLR.
-3. LeCun, Y., Cortes, C., & Burges, C. (1998). *The MNIST database of
-   handwritten digits.*
-4. Paszke, A. et al. (2019). *PyTorch: An Imperative Style, High-Performance
-   Deep Learning Library.* NeurIPS.
-5. Kingma, D. P., & Ba, J. (2015). *Adam: A Method for Stochastic
-   Optimization.* ICLR.
-6. Ioffe, S., & Szegedy, C. (2015). *Batch Normalization: Accelerating Deep
-   Network Training by Reducing Internal Covariate Shift.* ICML.
-7. Maas, A. L., Hannun, A. Y., & Ng, A. Y. (2013). *Rectifier Nonlinearities
-   Improve Neural Network Acoustic Models.* ICML.
-"""
+    # -- 4. References -------------------------------------------------------
+    st.markdown("### 4. References")
+    st.markdown(
+        "1. Goodfellow, I., Pouget-Abadie, J., Mirza, M., Xu, B., "
+        "Warde-Farley, D., Ozair, S., Courville, A., & Bengio, Y. (2014). "
+        "*Generative Adversarial Nets.* NeurIPS 27.\n"
+        "2. Radford, A., Metz, L., & Chintala, S. (2016). *Unsupervised "
+        "Representation Learning with Deep Convolutional Generative "
+        "Adversarial Networks.* ICLR.\n"
+        "3. LeCun, Y., Cortes, C., & Burges, C. (1998). *The MNIST database "
+        "of handwritten digits.*\n"
+        "4. Paszke, A. et al. (2019). *PyTorch: An Imperative Style, "
+        "High-Performance Deep Learning Library.* NeurIPS.\n"
+        "5. Kingma, D. P., & Ba, J. (2015). *Adam: A Method for Stochastic "
+        "Optimization.* ICLR.\n"
+        "6. Ioffe, S., & Szegedy, C. (2015). *Batch Normalization: "
+        "Accelerating Deep Network Training by Reducing Internal Covariate "
+        "Shift.* ICML.\n"
+        "7. Maas, A. L., Hannun, A. Y., & Ng, A. Y. (2013). *Rectifier "
+        "Nonlinearities Improve Neural Network Acoustic Models.* ICML."
     )
 
 
