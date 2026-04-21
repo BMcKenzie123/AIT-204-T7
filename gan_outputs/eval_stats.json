@@ -1,0 +1,13 @@
+{
+  "device": "cuda",
+  "epochs": 400,
+  "batch_size": 128,
+  "total_minutes": 22.080709513028463,
+  "final_d_loss": 0.1549592166979853,
+  "final_g_loss": 2.862704199094039,
+  "final_d_acc": 0.9502286992521367,
+  "mean_disc_score_on_real": 0.9050769805908203,
+  "mean_disc_score_on_fake": 0.10145150125026703,
+  "pct_fake_classified_real": 0.0072,
+  "pct_real_classified_real": 0.899
+}
